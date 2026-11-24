@@ -1,0 +1,304 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Tray icon that shows when Steam processes shaders, or has shader work left."""
+import json
+import os
+import re
+import sys
+
+import gi
+
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf, Gio, GLib  # noqa: E402
+
+STEAM = os.path.expanduser("~/.local/share/Steam")
+LOG = os.path.join(STEAM, "logs/shader_log.txt")
+OLD_LOG = os.path.join(STEAM, "logs/shader_log.previous.txt")
+STATE = os.path.join(GLib.get_user_state_dir(), "steam-shader-tray/state.json")
+ICON_DIRS = (
+    os.path.join(os.path.dirname(os.path.realpath(__file__)), "icons"),
+    os.path.join(GLib.get_user_data_dir(), "steam-shader-tray/icons"),
+)
+PATH = "/StatusNotifierItem"
+IFACE = "org.kde.StatusNotifierItem"
+XML = """<node><interface name="org.kde.StatusNotifierItem">
+<property name="Category" type="s" access="read"/>
+<property name="Id" type="s" access="read"/>
+<property name="Title" type="s" access="read"/>
+<property name="Status" type="s" access="read"/>
+<property name="IconName" type="s" access="read"/>
+<property name="IconPixmap" type="a(iiay)" access="read"/>
+<property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+<property name="ItemIsMenu" type="b" access="read"/>
+<method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+<method name="SecondaryActivate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+<method name="ContextMenu"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+<method name="Scroll"><arg type="i" direction="in"/><arg type="s" direction="in"/></method>
+<signal name="NewTitle"/><signal name="NewIcon"/><signal name="NewToolTip"/>
+<signal name="NewStatus"><arg type="s"/></signal>
+</interface></node>"""
+
+LINE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] (.*)$")
+PROGRESS = re.compile(r"Still replaying (\d+) \((\d+)%, (\d+)/(\d+)\)")
+NEW_DATA = re.compile(r"Committed bucket \d+ \(AppID (\d+)\) from (\d+) to (\d+)\.")
+STARTED = re.compile(r"Starting replay of FOZ databases for AppID (\d+)")
+COMPLETED = re.compile(r"\[ App ID (\d+) \] fossilize_replay completed")
+
+
+class Tray:
+    def __init__(self, conn):
+        self.conn = conn
+        self.names = {}
+        self.pixmaps = {name: load_pixmaps(name) for name in ("busy", "paused", "idle")}
+        self.view = {"status": "Passive", "icon": "idle", "title": "", "text": ""}
+        self.saved = self.load_state()
+        self.apps = self.saved.get("apps", {})
+        self.last = self.saved.get("last", "")
+        self.log = None
+        self.pending = ""
+        try:
+            with open(OLD_LOG, "rb") as f:
+                self.feed(f.read())
+        except OSError:
+            pass
+        self.reopen()
+        if self.log:
+            self.feed(self.log.read())
+
+    def load_state(self):
+        try:
+            with open(STATE) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def save_state(self):
+        data = {"last": self.last, "apps": self.apps}
+        if data != self.saved:
+            os.makedirs(os.path.dirname(STATE), exist_ok=True)
+            with open(STATE + ".tmp", "w") as f:
+                json.dump(data, f, indent=1)
+            os.replace(STATE + ".tmp", STATE)
+            self.saved = json.loads(json.dumps(data))
+
+    def reopen(self):
+        if self.log:
+            self.log.close()
+        try:
+            self.log = open(LOG, "rb")
+        except OSError:
+            self.log = None
+        self.pending = ""
+
+    def read_new_lines(self):
+        if self.log is None:
+            self.reopen()
+            if self.log is None:
+                return
+        self.feed(self.log.read())
+        try:
+            rotated = os.stat(LOG).st_ino != os.fstat(self.log.fileno()).st_ino
+            shrunk = os.path.getsize(LOG) < self.log.tell()
+        except OSError:
+            return
+        if rotated or shrunk:
+            if rotated:
+                self.feed(self.log.read())
+            self.reopen()
+            if self.log:
+                self.feed(self.log.read())
+
+    def feed(self, data):
+        lines = (self.pending + data.decode(errors="replace")).split("\n")
+        self.pending = lines.pop()
+        for line in lines:
+            m = LINE.match(line)
+            if not m or m.group(1) < self.last:
+                continue
+            self.last, message = m.groups()
+            self.apply(self.last, message)
+
+    def apply(self, when, message):
+        # A pass Steam stops, as when a game starts or Play is pressed, ends
+        # in a kill and not a completion, so an app stays unfinished from new
+        # shader data or a started pass until a pass completes.
+        m = PROGRESS.search(message)
+        if m:
+            app = self.apps.setdefault(m.group(1), {"state": "unfinished"})
+            app["progress"] = [int(x) for x in m.groups()[1:]]
+            app["at"] = when
+            return
+        m = NEW_DATA.search(message)
+        if m and m.group(2) != m.group(3):
+            self.apps[m.group(1)] = {"state": "unfinished", "at": when}
+            return
+        m = STARTED.search(message)
+        if m:
+            app = self.apps.setdefault(m.group(1), {})
+            app["state"] = "unfinished"
+            return
+        m = COMPLETED.search(message)
+        if m:
+            self.apps[m.group(1)] = {"state": "done", "at": when}
+
+    def app_name(self, appid):
+        if appid not in self.names:
+            self.names[appid] = None
+            try:
+                with open(os.path.join(STEAM, "steamapps/libraryfolders.vdf")) as f:
+                    libraries = re.findall(r'"path"\s+"([^"]+)"', f.read())
+            except OSError:
+                libraries = [STEAM]
+            for library in libraries:
+                try:
+                    with open(f"{library}/steamapps/appmanifest_{appid}.acf") as f:
+                        m = re.search(r'"name"\s+"([^"]+)"', f.read())
+                except OSError:
+                    continue
+                if m:
+                    self.names[appid] = m.group(1)
+                    break
+        return self.names[appid]
+
+    def describe(self, appid):
+        progress = self.apps.get(appid, {}).get("progress")
+        name = self.app_name(appid) or f"App {appid}"
+        if not progress:
+            return name
+        return f"{name}: {progress[0]}%, {progress[1]}/{progress[2]}"
+
+    def refresh(self):
+        self.read_new_lines()
+        self.save_state()
+        running = running_appids()
+        left = sorted(
+            appid
+            for appid, app in self.apps.items()
+            if app.get("state") == "unfinished"
+            and appid not in running
+            and self.app_name(appid)
+        )
+        if running:
+            lines = [self.describe(appid) for appid in sorted(running)]
+            if left:
+                lines.append("Also not finished: " + ", ".join(map(self.app_name, left)))
+            view = {
+                "status": "Active",
+                "icon": "busy",
+                "title": "Steam is processing shaders",
+                "text": "\n".join(lines) + "\nWait before pressing Play.",
+            }
+        elif left:
+            view = {
+                "status": "Active",
+                "icon": "paused",
+                "title": "Shader processing not finished",
+                "text": "\n".join(self.describe(appid) for appid in left)
+                + "\nSteam is not processing shaders now. Play processes what is left first.",
+            }
+        else:
+            view = {
+                "status": "Passive",
+                "icon": "idle",
+                "title": "Shaders processed",
+                "text": "No game has shader processing left.",
+            }
+        if view != self.view:
+            self.view = view
+            for signal in ("NewIcon", "NewTitle", "NewToolTip"):
+                self.conn.emit_signal(None, PATH, IFACE, signal, None)
+            self.conn.emit_signal(
+                None, PATH, IFACE, "NewStatus", GLib.Variant("(s)", (view["status"],))
+            )
+        return True
+
+    def get_property(self, conn, sender, path, iface, prop):
+        pixmaps = self.pixmaps[self.view["icon"]]
+        values = {
+            "Category": GLib.Variant("s", "SystemServices"),
+            "Id": GLib.Variant("s", "steam-shader-tray"),
+            "Title": GLib.Variant("s", self.view["title"]),
+            "Status": GLib.Variant("s", self.view["status"]),
+            "IconName": GLib.Variant("s", ""),
+            "IconPixmap": GLib.Variant("a(iiay)", pixmaps),
+            "ItemIsMenu": GLib.Variant("b", False),
+            "ToolTip": GLib.Variant(
+                "(sa(iiay)ss)", ("", pixmaps, self.view["title"], self.view["text"])
+            ),
+        }
+        return values[prop]
+
+
+def load_pixmaps(name):
+    # Pixmaps, not an icon name: Plasma trims an icon name it cannot find at
+    # its dashes, and showed the "steam" icon for steam-shader-tray-busy.
+    for folder in ICON_DIRS:
+        svg = os.path.join(folder, f"steam-shader-tray-{name}.svg")
+        if os.path.exists(svg):
+            break
+    else:
+        sys.exit(f"steam-shader-tray: icon steam-shader-tray-{name}.svg not found")
+    pixmaps = []
+    for size in (16, 22, 24, 32, 48, 64):
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(svg, size, size)
+        if not pixbuf.get_has_alpha():
+            pixbuf = pixbuf.add_alpha(False, 0, 0, 0)
+        width, height = pixbuf.get_width(), pixbuf.get_height()
+        stride, pixels = pixbuf.get_rowstride(), pixbuf.get_pixels()
+        rgba = b"".join(pixels[row * stride : row * stride + width * 4] for row in range(height))
+        argb = bytearray(len(rgba))
+        argb[0::4], argb[1::4] = rgba[3::4], rgba[0::4]
+        argb[2::4], argb[3::4] = rgba[1::4], rgba[2::4]
+        pixmaps.append((width, height, bytes(argb)))
+    return pixmaps
+
+
+def running_appids():
+    appids = set()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = f.read().split(b"\0")
+        except OSError:
+            continue
+        if args and args[0].endswith(b"fossilize_replay"):
+            m = re.search(rb"shadercache/(\d+)/", b" ".join(args))
+            if m:
+                appids.add(m.group(1).decode())
+    return appids
+
+
+def main():
+    conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    reply = conn.call_sync(
+        "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+        "RequestName", GLib.Variant("(su)", ("local.SteamShaderTray", 4)),
+        None, Gio.DBusCallFlags.NONE, -1, None,
+    )
+    if reply.unpack()[0] != 1:
+        sys.exit("steam-shader-tray is already running")
+    tray = Tray(conn)
+    info = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
+    conn.register_object(PATH, info, lambda *args: args[-1].return_value(None),
+                         tray.get_property, None)
+    tray.refresh()
+
+    def register(*_):
+        conn.call(
+            "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+            "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
+            GLib.Variant("(s)", (conn.get_unique_name(),)),
+            None, Gio.DBusCallFlags.NONE, -1, None, None,
+        )
+
+    Gio.bus_watch_name_on_connection(
+        conn, "org.kde.StatusNotifierWatcher", Gio.BusNameWatcherFlags.NONE, register, None
+    )
+    GLib.timeout_add_seconds(5, tray.refresh)
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()
