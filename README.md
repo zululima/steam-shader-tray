@@ -11,8 +11,7 @@ on its "Processing Vulkan shaders" dialog.
 Steam processes a game's shaders in the background after the game installs or
 gets new shader data. Pressing Play before that is done stops the background
 pass and runs the rest in the dialog. Steam also holds background passes while
-another game runs. The installer turns on a Steam setting meant to keep them
-going, and the tray then pauses them only during the games on its pause list.
+another game runs.
 
 | Icon | Shown when | Tooltip |
 | --- | --- | --- |
@@ -37,9 +36,13 @@ Tested on KDE Plasma 6.8 on CachyOS.
 ## Install
 
 The script installs the tray for your user, adds it to the programs that start
-at login and starts it. It also adds `bShaderAlwaysProcessWhenRunningGame 1`
-to Steam's `steam_dev.cfg`, which Steam reads when it starts, so restart Steam
-after the first install. The setting is not documented by Valve.
+at login and starts it.
+
+The version of 2026-11-25 also added `bShaderAlwaysProcessWhenRunningGame 1`
+to Steam's `steam_dev.cfg`. With it, Steam's desktop window showed "Something
+went wrong while displaying this content" each time a non-Steam game started.
+The install and uninstall scripts now take the line out and say so; restart
+Steam after that.
 
 ```bash
 git clone https://github.com/zululima/steam-shader-tray.git && \
@@ -54,8 +57,10 @@ frame counts. The installer creates it with Counter-Strike 2, app ID 730. A
 game's app ID is the number in the address of its Steam store page.
 
 While a listed game runs, the tray stops Steam's shader processes, and it
-continues them when the game exits or the tray quits. The tray reads the list
-every 5 seconds, so a change applies without a restart.
+continues them when the game exits or the tray quits. Steam holds its
+background passes during games by itself, so the list acts only on a pass that
+runs while a listed game runs anyway. The tray reads the list every 5 seconds,
+so a change applies without a restart.
 
 ## Uninstall
 
