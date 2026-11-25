@@ -39,6 +39,8 @@ XML = """<node><interface name="org.kde.StatusNotifierItem">
 <signal name="NewTitle"/><signal name="NewIcon"/><signal name="NewToolTip"/>
 <signal name="NewStatus"><arg type="s"/></signal>
 </interface></node>"""
+INFO = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
+NOTIFICATIONS = "org.freedesktop.Notifications"
 
 LINE = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] (.*)$")
 PROGRESS = re.compile(r"Still replaying (\d+) \((\d+)%, (\d+)/(\d+)\)")
@@ -50,9 +52,15 @@ COMPLETED = re.compile(r"\[ App ID (\d+) \] fossilize_replay completed")
 class Tray:
     def __init__(self, conn):
         self.conn = conn
+        self.item = None
         self.names = {}
-        self.pixmaps = {name: load_pixmaps(name) for name in ("busy", "paused", "idle")}
+        self.pixmaps = {name: load_pixmaps(find_icon(name)) for name in ("busy", "paused")}
+        self.done_icon = find_icon("idle")
         self.view = {"status": "Passive", "icon": "idle", "title": "", "text": ""}
+        self.shown = set()
+        self.finished = []
+        self.notes = set()
+        self.ready = False
         self.saved = self.load_state()
         self.apps = self.saved.get("apps", {})
         self.last = self.saved.get("last", "")
@@ -67,6 +75,7 @@ class Tray:
         self.reopen()
         if self.log:
             self.feed(self.log.read())
+        self.ready = True
 
     def load_state(self):
         try:
@@ -143,6 +152,8 @@ class Tray:
             return
         m = COMPLETED.search(message)
         if m:
+            if self.ready and m.group(1) in self.shown:
+                self.finished.append(m.group(1))
             self.apps[m.group(1)] = {"state": "done", "at": when}
 
     def app_name(self, appid):
@@ -232,14 +243,75 @@ class Tray:
                 "title": "Shaders processed",
                 "text": "No game has shader processing left.",
             }
+        self.shown = running | set(left)
+        if self.finished:
+            self.notify_done(self.finished)
+            self.finished = []
         if view != self.view:
             self.view = view
-            for name in ("NewIcon", "NewTitle", "NewToolTip"):
-                self.conn.emit_signal(None, PATH, IFACE, name, None)
-            self.conn.emit_signal(
-                None, PATH, IFACE, "NewStatus", GLib.Variant("(s)", (view["status"],))
-            )
+            if view["icon"] == "idle":
+                self.hide_item()
+            elif self.item is None:
+                self.show_item()
+            else:
+                for name in ("NewIcon", "NewTitle", "NewToolTip"):
+                    self.item.emit_signal(None, PATH, IFACE, name, None)
+                self.item.emit_signal(
+                    None, PATH, IFACE, "NewStatus", GLib.Variant("(s)", (view["status"],))
+                )
         return True
+
+    def show_item(self):
+        # The item gets a bus connection of its own, closed when nothing is
+        # left, since Plasma lists even a Passive item among its hidden icons.
+        address = Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION, None)
+        self.item = Gio.DBusConnection.new_for_address_sync(
+            address,
+            Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+            | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+            None, None,
+        )
+        self.item.register_object(PATH, INFO, lambda *args: args[-1].return_value(None),
+                                  self.get_property, None)
+        self.register()
+
+    def hide_item(self):
+        if self.item:
+            self.item.close_sync(None)
+            self.item = None
+
+    def register(self):
+        if self.item:
+            self.item.call(
+                "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+                "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
+                GLib.Variant("(s)", (self.item.get_unique_name(),)),
+                None, Gio.DBusCallFlags.NONE, -1, None, None,
+            )
+
+    def notify_done(self, appids):
+        names = [self.app_name(appid) or f"App {appid}" for appid in appids]
+        verb = "is" if len(names) == 1 else "are"
+        self.conn.call(
+            NOTIFICATIONS, "/org/freedesktop/Notifications", NOTIFICATIONS, "Notify",
+            GLib.Variant("(susssasa{sv}i)", (
+                "Steam shader tray", 0, self.done_icon, "Shaders processed",
+                f"{', '.join(names)} {verb} ready to play.",
+                ["default", "Open Steam"], {}, -1,
+            )),
+            GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, -1, None, self.noted,
+        )
+
+    def noted(self, conn, result):
+        try:
+            self.notes.add(conn.call_finish(result).unpack()[0])
+        except GLib.Error:
+            pass
+
+    def clicked(self, conn, sender, path, iface, signal_name, params):
+        note, action = params.unpack()
+        if note in self.notes and action == "default":
+            GLib.spawn_async(["steam", "steam://open/games"], flags=GLib.SpawnFlags.SEARCH_PATH)
 
     def get_property(self, conn, sender, path, iface, prop):
         pixmaps = self.pixmaps[self.view["icon"]]
@@ -258,15 +330,17 @@ class Tray:
         return values[prop]
 
 
-def load_pixmaps(name):
-    # Pixmaps, not an icon name: Plasma trims an icon name it cannot find at
-    # its dashes, and showed the "steam" icon for steam-shader-tray-busy.
+def find_icon(name):
     for folder in ICON_DIRS:
         svg = os.path.join(folder, f"steam-shader-tray-{name}.svg")
         if os.path.exists(svg):
-            break
-    else:
-        sys.exit(f"steam-shader-tray: icon steam-shader-tray-{name}.svg not found")
+            return svg
+    sys.exit(f"steam-shader-tray: icon steam-shader-tray-{name}.svg not found")
+
+
+def load_pixmaps(svg):
+    # Pixmaps, not an icon name: Plasma trims an icon name it cannot find at
+    # its dashes, and showed the "steam" icon for steam-shader-tray-busy.
     pixmaps = []
     for size in (16, 22, 24, 32, 48, 64):
         pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(svg, size, size)
@@ -342,21 +416,13 @@ def main():
     if reply.unpack()[0] != 1:
         sys.exit("steam-shader-tray is already running")
     tray = Tray(conn)
-    info = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
-    conn.register_object(PATH, info, lambda *args: args[-1].return_value(None),
-                         tray.get_property, None)
+    conn.signal_subscribe(NOTIFICATIONS, NOTIFICATIONS, "ActionInvoked",
+                          "/org/freedesktop/Notifications", None,
+                          Gio.DBusSignalFlags.NONE, tray.clicked)
     tray.refresh()
-
-    def register(*_):
-        conn.call(
-            "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
-            "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
-            GLib.Variant("(s)", (conn.get_unique_name(),)),
-            None, Gio.DBusCallFlags.NONE, -1, None, None,
-        )
-
     Gio.bus_watch_name_on_connection(
-        conn, "org.kde.StatusNotifierWatcher", Gio.BusNameWatcherFlags.NONE, register, None
+        conn, "org.kde.StatusNotifierWatcher", Gio.BusNameWatcherFlags.NONE,
+        lambda *_: tray.register(), None,
     )
     GLib.timeout_add_seconds(5, tray.refresh)
     loop = GLib.MainLoop()

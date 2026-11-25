@@ -18,9 +18,11 @@ going, and the tray then pauses them only during the games on its pause list.
 | --- | --- | --- |
 | <img src="src/icons/steam-shader-tray-busy.svg" width="22" alt="Hourglass"> | Steam is processing shaders | Each game with Steam's progress figures |
 | <img src="src/icons/steam-shader-tray-paused.svg" width="22" alt="Pause"> | A game has shaders left but nothing processes them, or a game on the pause list runs | Each game with the last progress figures |
-| <img src="src/icons/steam-shader-tray-idle.svg" width="22" alt="Check mark"> | No game has shaders left | That no game has shaders left |
 
-KDE Plasma puts the check mark among the tray's hidden icons.
+When no game has shaders left, the icon goes away, and a notification with
+<img src="src/icons/steam-shader-tray-idle.svg" width="16" alt="Check mark"> a
+check mark names the games whose processing finished while it showed. Clicking
+the notification opens Steam's library.
 
 ## Requirements
 
