@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import signal
 import sys
 
 import gi
@@ -15,6 +16,7 @@ STEAM = os.path.expanduser("~/.local/share/Steam")
 LOG = os.path.join(STEAM, "logs/shader_log.txt")
 OLD_LOG = os.path.join(STEAM, "logs/shader_log.previous.txt")
 STATE = os.path.join(GLib.get_user_state_dir(), "steam-shader-tray/state.json")
+PAUSE_LIST = os.path.join(GLib.get_user_config_dir(), "steam-shader-tray/pause-during")
 ICON_DIRS = (
     os.path.join(os.path.dirname(os.path.realpath(__file__)), "icons"),
     os.path.join(GLib.get_user_data_dir(), "steam-shader-tray/icons"),
@@ -56,6 +58,7 @@ class Tray:
         self.last = self.saved.get("last", "")
         self.log = None
         self.pending = ""
+        self.stopped = stopped_pids(scan_processes()[0])
         try:
             with open(OLD_LOG, "rb") as f:
                 self.feed(f.read())
@@ -89,6 +92,7 @@ class Tray:
         except OSError:
             self.log = None
         self.pending = ""
+        self.stopped = stopped_pids(scan_processes()[0])
 
     def read_new_lines(self):
         if self.log is None:
@@ -167,10 +171,26 @@ class Tray:
             return name
         return f"{name}: {progress[0]}%, {progress[1]}/{progress[2]}"
 
+    def hold(self, replays, pausing):
+        if pausing:
+            for pid in replays.keys() - self.stopped:
+                send(pid, signal.SIGSTOP)
+            self.stopped = set(replays)
+        else:
+            for pid in self.stopped & replays.keys():
+                send(pid, signal.SIGCONT)
+            self.stopped = set()
+
+    def release(self):
+        self.hold(scan_processes()[0], False)
+
     def refresh(self):
         self.read_new_lines()
         self.save_state()
-        running = running_appids()
+        replays, games = scan_processes()
+        pausers = sorted(games & read_pause_list())
+        self.hold(replays, bool(pausers))
+        running = {appid for appid in replays.values() if appid}
         left = sorted(
             appid
             for appid, app in self.apps.items()
@@ -182,12 +202,21 @@ class Tray:
             lines = [self.describe(appid) for appid in sorted(running)]
             if left:
                 lines.append("Also not finished: " + ", ".join(map(self.app_name, left)))
-            view = {
-                "status": "Active",
-                "icon": "busy",
-                "title": "Steam is processing shaders",
-                "text": "\n".join(lines) + "\nWait before pressing Play.",
-            }
+            if pausers:
+                names = ", ".join(self.app_name(appid) or f"App {appid}" for appid in pausers)
+                view = {
+                    "status": "Active",
+                    "icon": "paused",
+                    "title": "Shader processing paused",
+                    "text": "\n".join(lines) + f"\nPaused while {names} runs.",
+                }
+            else:
+                view = {
+                    "status": "Active",
+                    "icon": "busy",
+                    "title": "Steam is processing shaders",
+                    "text": "\n".join(lines) + "\nWait before pressing Play.",
+                }
         elif left:
             view = {
                 "status": "Active",
@@ -205,8 +234,8 @@ class Tray:
             }
         if view != self.view:
             self.view = view
-            for signal in ("NewIcon", "NewTitle", "NewToolTip"):
-                self.conn.emit_signal(None, PATH, IFACE, signal, None)
+            for name in ("NewIcon", "NewTitle", "NewToolTip"):
+                self.conn.emit_signal(None, PATH, IFACE, name, None)
             self.conn.emit_signal(
                 None, PATH, IFACE, "NewStatus", GLib.Variant("(s)", (view["status"],))
             )
@@ -253,8 +282,9 @@ def load_pixmaps(name):
     return pixmaps
 
 
-def running_appids():
-    appids = set()
+def scan_processes():
+    """Steam's shader passes as {pid: app ID or None}, and the app IDs of running games."""
+    replays, games = {}, set()
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
@@ -263,11 +293,43 @@ def running_appids():
                 args = f.read().split(b"\0")
         except OSError:
             continue
-        if args and args[0].endswith(b"fossilize_replay"):
+        if args[0].endswith(b"fossilize_replay"):
             m = re.search(rb"shadercache/(\d+)/", b" ".join(args))
-            if m:
-                appids.add(m.group(1).decode())
-    return appids
+            replays[int(pid)] = m.group(1).decode() if m else None
+        elif args[0].endswith(b"reaper") and b"SteamLaunch" in args:
+            for arg in args:
+                if arg.startswith(b"AppId="):
+                    games.add(arg[6:].decode())
+                    break
+    return replays, games
+
+
+def stopped_pids(pids):
+    # Passes a killed tray left stopped, continued at the first refresh.
+    stopped = set()
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                if f.read().rsplit(")", 1)[1].split()[0] == "T":
+                    stopped.add(pid)
+        except (OSError, IndexError):
+            pass
+    return stopped
+
+
+def read_pause_list():
+    try:
+        with open(PAUSE_LIST) as f:
+            return {m.group(1) for m in map(re.compile(r"\s*(\d+)").match, f) if m}
+    except OSError:
+        return set()
+
+
+def send(pid, sig):
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
 
 
 def main():
@@ -297,7 +359,16 @@ def main():
         conn, "org.kde.StatusNotifierWatcher", Gio.BusNameWatcherFlags.NONE, register, None
     )
     GLib.timeout_add_seconds(5, tray.refresh)
-    GLib.MainLoop().run()
+    loop = GLib.MainLoop()
+
+    def quit():
+        tray.release()
+        loop.quit()
+        return False
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, quit)
+    loop.run()
 
 
 if __name__ == "__main__":
